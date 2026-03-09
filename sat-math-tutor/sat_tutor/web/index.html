@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAT Tutor - Web</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: "Segoe UI", system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 24px; background: #f5f5f5; }
+    h1 { color: #1a1a2e; font-size: 1.5rem; margin-bottom: 8px; }
+    .subtitle { color: #666; font-size: 0.9rem; margin-bottom: 24px; }
+    .step { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .step h2 { margin: 0 0 12px; font-size: 1.1rem; color: #333; }
+    .step.disabled { opacity: 0.6; pointer-events: none; }
+    label { display: block; margin: 8px 0 4px; color: #444; }
+    input[type=text], input[type=number], select { padding: 8px 10px; width: 100%; max-width: 400px; border: 1px solid #ccc; border-radius: 4px; }
+    input[type=file] { margin-top: 4px; }
+    .radio-group { margin: 12px 0; }
+    .radio-group label { display: flex; align-items: flex-start; gap: 8px; margin: 6px 0; cursor: pointer; }
+    .radio-group input { width: auto; margin-top: 4px; }
+    button, .btn { display: inline-block; padding: 10px 20px; background: #2563eb; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 0.95rem; margin-top: 8px; }
+    button:hover, .btn:hover { background: #1d4ed8; }
+    button:disabled { background: #94a3b8; cursor: not-allowed; }
+    .msg { margin-top: 12px; padding: 10px; border-radius: 6px; font-size: 0.9rem; }
+    .msg.ok { background: #dcfce7; color: #166534; }
+    .msg.err { background: #fee2e2; color: #991b1b; }
+    .msg.info { background: #e0f2fe; color: #0369a1; }
+    #questions-list { max-height: 400px; overflow-y: auto; }
+    .q-item { border-bottom: 1px solid #eee; padding: 12px 0; }
+    .q-item .q-id { font-weight: 600; color: #1e40af; }
+    .q-item .q-stem { color: #555; font-size: 0.9rem; margin: 6px 0; white-space: pre-wrap; }
+    .q-item input { max-width: 120px; }
+    .report pre { white-space: pre-wrap; font-size: 0.85rem; background: #f8fafc; padding: 12px; border-radius: 6px; max-height: 400px; overflow: auto; }
+    .dim { color: #64748b; font-size: 0.9rem; }
+    #perQuestionCard { margin: 12px 0; padding: 12px; background: #f8fafc; border-radius: 6px; }
+    #perQuestionFeedback.ok { background: #dcfce7; color: #166534; }
+    #perQuestionFeedback.err { background: #fee2e2; color: #991b1b; }
+  </style>
+</head>
+<body>
+  <h1>SAT Tutor</h1>
+  <p class="subtitle">Step-by-step flow, same as CLI</p>
+
+  <!-- Step 1: Select PDF + transcribe -->
+  <div class="step" id="step1">
+    <h2>Step 1: Select PDF and transcribe</h2>
+    <form id="form1">
+      <label>PDF file (from project)</label>
+      <select name="pdf_path" id="pdfSelect" required>
+        <option value="">-- Loading... --</option>
+      </select>
+      <label>Subject</label>
+      <select name="subject">
+        <option value="math">Math (Vision LLM)</option>
+        <option value="english">English (OCR)</option>
+      </select>
+      <label>Run mode</label>
+      <select name="mode">
+        <option value="diagnose">diagnose (full diagnosis)</option>
+        <option value="solve">solve (solve only)</option>
+        <option value="transcribe_only">transcribe_only (extract only)</option>
+      </select>
+      <label>Page range</label>
+      <input type="text" name="pages" value="all" placeholder="all or 1-3,5">
+      <label>Image DPI</label>
+      <input type="number" name="dpi" value="300" min="150" max="400">
+      <button type="submit">Start (Stage 0 + Transcribe)</button>
+    </form>
+    <div id="msg1" class="msg" style="display:none;"></div>
+  </div>
+
+  <!-- Step 2: Correct answers source -->
+  <div class="step disabled" id="step2">
+    <h2>Step 2: Correct answers</h2>
+    <p>You can choose:</p>
+    <form id="form2">
+      <div class="radio-group">
+        <label><input type="radio" name="correct_src" value="file"> [1] Provide correct answers file → Skip LLM solving, use your answers</label>
+        <label><input type="radio" name="correct_src" value="llm" checked> [2] Don't provide → Use LLM to solve automatically</label>
+      </div>
+      <div id="correctFileWrap" style="display:none;">
+        <label>Correct answers file (JSON, e.g. {"p1_q1":"A","p1_q2":"7"})</label>
+        <input type="file" name="correct_file" accept=".json">
+      </div>
+      <button type="submit">Next (Stage S: Solve)</button>
+    </form>
+    <div id="msg2" class="msg" style="display:none;"></div>
+  </div>
+
+  <!-- Step 3: User answer input -->
+  <div class="step disabled" id="step3">
+    <h2>Step 3: User answer input</h2>
+    <p>You can choose:</p>
+    <form id="form3">
+      <div class="radio-group">
+        <label><input type="radio" name="answer_src" value="interactive" checked> [1] Interactive → Display questions and enter answers one by one</label>
+        <label><input type="radio" name="answer_src" value="file"> [2] Batch file → Upload an answer file (JSON)</label>
+        <label><input type="radio" name="answer_src" value="simulated"> [3] Simulate student → AI answers (will make some mistakes on purpose)</label>
+      </div>
+      <div id="feedbackTimingWrap" style="display:none;">
+        <p><strong>Feedback timing</strong> (when to show diagnosis):</p>
+        <div class="radio-group">
+          <label><input type="radio" name="feedback_timing" value="per_question"> [1] Immediate feedback → Diagnose each question right after you answer it</label>
+          <label><input type="radio" name="feedback_timing" value="after_all" checked> [2] After all answers → Finish all questions first, then diagnose</label>
+        </div>
+      </div>
+      <div id="answersFileWrap" style="display:none;">
+        <label>User answers file (JSON)</label>
+        <input type="file" name="answers_file" accept=".json">
+      </div>
+      <p id="step3Hint" style="display:none; margin-top:8px;" class="dim">Confirm above, then go to Step 4 to choose diagnosis mode. You will start answering after Step 4.</p>
+      <button type="submit" id="btn3">Submit and continue</button>
+    </form>
+    <div id="msg3" class="msg" style="display:none;"></div>
+  </div>
+
+  <!-- Step 4: Diagnosis mode -->
+  <div class="step disabled" id="step4">
+    <h2>Step 4: Diagnosis mode</h2>
+    <form id="form4">
+      <div class="radio-group">
+        <label><input type="radio" name="diagnose_mode" value="A"> Mode A: Direct solution and full steps</label>
+        <label><input type="radio" name="diagnose_mode" value="B" checked> Mode B: Contrastive (why wrong, correct approach)</label>
+        <label><input type="radio" name="diagnose_mode" value="C"> Mode C: Scaffolded (hints first, then full answer)</label>
+      </div>
+      <button type="submit" id="btn4">Confirm and continue</button>
+    </form>
+    <div id="msg4" class="msg" style="display:none;"></div>
+    <div id="step4AnswerAllWrap" style="display:none; margin-top:16px;">
+      <p><strong>Enter your answer for each question</strong> (A–E for multiple choice, number or fraction for numeric):</p>
+      <div id="questions-list"></div>
+      <button type="button" id="btnSubmitAllAnswers">Submit all answers and run diagnosis</button>
+    </div>
+    <div id="step4PerQuestionWrap" style="display:none; margin-top:16px;">
+      <p id="perQuestionProgress" class="dim"></p>
+      <div id="perQuestionCard" class="q-item"></div>
+      <label>Your answer <input type="text" id="perQuestionAnswer" placeholder="A–E or number"></label>
+      <button type="button" id="btnPerQuestionSubmit">Submit answer</button>
+      <div id="perQuestionFeedback" class="msg" style="display:none; margin-top:12px;"></div>
+      <button type="button" id="btnPerQuestionNext" style="display:none;">Next question</button>
+      <div id="perQuestionReport" style="display:none; margin-top:16px;"></div>
+    </div>
+  </div>
+
+  <!-- Step 5: Run diagnose -->
+  <div class="step disabled" id="step5">
+    <h2>Step 5: Run diagnosis</h2>
+    <button type="button" id="btnRunDiagnose">Run diagnosis (Stage D)</button>
+    <div id="msg5" class="msg" style="display:none;"></div>
+    <div id="report" class="report" style="display:none; margin-top:16px;"></div>
+  </div>
+
+  <script>
+    let sessionId = null;
+
+    function showMsg(elId, text, type) {
+      const el = document.getElementById(elId);
+      el.textContent = text;
+      el.className = 'msg ' + (type || 'info');
+      el.style.display = 'block';
+    }
+    function enableStep(stepNum) {
+      document.getElementById('step' + stepNum).classList.remove('disabled');
+    }
+
+    // Load PDF list on page load
+    (async function loadPdfs() {
+      const sel = document.getElementById('pdfSelect');
+      try {
+        const res = await fetch('/api/pdfs');
+        const data = await res.json();
+        const paths = data.paths || [];
+        sel.innerHTML = paths.length ? '<option value="">-- Select a PDF --</option>' : '<option value="">No PDFs found under data/</option>';
+        paths.forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p;
+          opt.textContent = p;
+          sel.appendChild(opt);
+        });
+      } catch (e) {
+        sel.innerHTML = '<option value="">Failed to load list</option>';
+      }
+    })();
+
+    // Step 1
+    document.getElementById('form1').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const pdfPath = fd.get('pdf_path');
+      if (!pdfPath) { showMsg('msg1', 'Please select a PDF from the list.', 'err'); return; }
+      showMsg('msg1', 'Processing PDF and transcribing…', 'info');
+      try {
+        const res = await fetch('/api/sessions/start', { method: 'POST', body: fd });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        sessionId = data.session_id;
+        showMsg('msg1', 'Transcribe done: ' + data.question_count + ' questions.' + (data.failed_pages && data.failed_pages.length ? ' Failed pages: ' + data.failed_pages.join(',') : ''), 'ok');
+        enableStep(2);
+      } catch (err) {
+        showMsg('msg1', 'Error: ' + err.message, 'err');
+      }
+    });
+
+    // Step 2
+    document.getElementById('form2').querySelectorAll('input[name="correct_src"]').forEach(r => {
+      r.addEventListener('change', () => {
+        document.getElementById('correctFileWrap').style.display = r.value === 'file' ? 'block' : 'none';
+      });
+    });
+    document.getElementById('form2').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const correctSrcEl = document.getElementById('form2').querySelector('input[name="correct_src"]:checked');
+      const useLlm = correctSrcEl ? correctSrcEl.value === 'llm' : true;
+      const fd = new FormData();
+      fd.append('use_llm', useLlm);
+      if (!useLlm) {
+        const fileInput = document.getElementById('form2').querySelector('input[name="correct_file"]');
+        if (!fileInput || !fileInput.files.length) { showMsg('msg2', 'Please select a correct answers JSON file.', 'err'); return; }
+        fd.append('file', fileInput.files[0]);
+      }
+      showMsg('msg2', 'Solving…', 'info');
+      try {
+        const res = await fetch('/api/sessions/' + sessionId + '/correct-answers', { method: 'POST', body: fd });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        showMsg('msg2', 'Solve done: ' + data.solve_count + ' questions.', 'ok');
+        enableStep(3);
+        const answerSrcEl = document.querySelector('input[name="answer_src"]:checked');
+        if (answerSrcEl && answerSrcEl.value === 'interactive') {
+          document.getElementById('feedbackTimingWrap').style.display = 'block';
+          document.getElementById('step3Hint').style.display = 'block';
+        }
+        if (answerSrcEl && answerSrcEl.value === 'file') document.getElementById('answersFileWrap').style.display = 'block';
+      } catch (err) {
+        showMsg('msg2', 'Error: ' + err.message, 'err');
+      }
+    });
+
+    let pendingMethod = '';
+    let pendingFeedbackTiming = 'after_all';
+    let pendingFile = null;
+
+    // Step 3: only choose method + feedback timing (no questions, no API)
+    document.querySelectorAll('input[name="answer_src"]').forEach(r => {
+      r.addEventListener('change', () => {
+        document.getElementById('answersFileWrap').style.display = r.value === 'file' ? 'block' : 'none';
+        document.getElementById('feedbackTimingWrap').style.display = r.value === 'interactive' ? 'block' : 'none';
+        document.getElementById('step3Hint').style.display = r.value === 'interactive' ? 'block' : 'none';
+      });
+    });
+    async function loadQuestions() {
+      try {
+        const res = await fetch('/api/sessions/' + sessionId + '/questions');
+        const data = await res.json();
+        const list = document.getElementById('questions-list');
+        list.innerHTML = '';
+        (data.questions || []).forEach(q => {
+          const isNum = q.problem_type === 'numeric_entry';
+          const div = document.createElement('div');
+          div.className = 'q-item';
+          div.innerHTML = '<span class="q-id">' + q.id + '</span> ' + (isNum ? '[Numeric]' : '[Multiple choice]') +
+            '<div class="q-stem">' + (q.stem || '').slice(0, 200) + (q.stem && q.stem.length > 200 ? '…' : '') + '</div>' +
+            '<label>Answer <input type="text" name="ans_' + q.id + '" placeholder="' + (isNum ? 'number or fraction' : 'A-E') + '" data-id="' + q.id + '"></label>';
+          list.appendChild(div);
+        });
+      } catch (e) {
+        showMsg('msg4', 'Failed to load questions: ' + e.message, 'err');
+      }
+    }
+    let perQuestionList = [];
+    let perQuestionIndex = 0;
+
+    function renderPerQuestion() {
+      const q = perQuestionList[perQuestionIndex];
+      if (!q) return;
+      document.getElementById('perQuestionProgress').textContent = 'Question ' + (perQuestionIndex + 1) + ' of ' + perQuestionList.length + ' (' + q.id + ')';
+      const isNum = q.problem_type === 'numeric_entry';
+      let html = '<span class="q-id">' + q.id + '</span> ' + (isNum ? '[Numeric]' : '[Multiple choice]') +
+        '<div class="q-stem">' + (q.stem || '').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+      if (!isNum && q.choices) {
+        for (const opt of ['A','B','C','D','E']) {
+          const c = q.choices[opt];
+          if (c) html += '<div>' + opt + ': ' + (c + '').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+        }
+      }
+      document.getElementById('perQuestionCard').innerHTML = html;
+      document.getElementById('perQuestionAnswer').value = '';
+      document.getElementById('perQuestionAnswer').placeholder = isNum ? 'number or fraction' : 'A–E';
+      document.getElementById('perQuestionFeedback').style.display = 'none';
+      document.getElementById('btnPerQuestionNext').style.display = 'none';
+      document.getElementById('btnPerQuestionSubmit').style.display = 'inline-block';
+    }
+
+    document.getElementById('form3').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const method = document.querySelector('input[name="answer_src"]:checked').value;
+      const ftEl = document.querySelector('input[name="feedback_timing"]:checked');
+      pendingFeedbackTiming = ftEl ? ftEl.value : 'after_all';
+      pendingMethod = method;
+      pendingFile = null;
+      if (method === 'file') {
+        const fileInput = document.querySelector('input[name="answers_file"]');
+        if (!fileInput.files.length) { showMsg('msg3', 'Please select a user answers JSON file.', 'err'); return; }
+        pendingFile = fileInput.files[0];
+      }
+      showMsg('msg3', 'Go to Step 4 to choose diagnosis mode, then you will start answering.', 'ok');
+      enableStep(4);
+    });
+
+    document.getElementById('btnPerQuestionSubmit').addEventListener('click', async () => {
+      const q = perQuestionList[perQuestionIndex];
+      if (!q) return;
+      const answer = document.getElementById('perQuestionAnswer').value.trim();
+      if (!answer) { showMsg('msg4', 'Enter your answer.', 'err'); return; }
+      const fd = new FormData();
+      fd.append('question_id', q.id);
+      fd.append('answer', answer);
+      document.getElementById('btnPerQuestionSubmit').disabled = true;
+      const fb = document.getElementById('perQuestionFeedback');
+      fb.style.display = 'block';
+      fb.className = 'msg info';
+      fb.innerHTML = 'Checking…';
+      try {
+        const res = await fetch('/api/sessions/' + sessionId + '/answer-and-diagnose-one', { method: 'POST', body: fd });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        const dr = data.diagnose_result;
+        if (dr) {
+          if (dr.is_correct) {
+            fb.className = 'msg ok';
+            fb.innerHTML = '<strong>Correct.</strong>';
+          } else {
+            fb.className = 'msg err';
+            let s = '<strong>Incorrect.</strong> Your answer: ' + (dr.user_answer || '') + '. Correct: ' + (dr.correct_answer || '') + '.';
+            if (dr.why_user_choice_is_tempting) s += '<br><br>' + (dr.why_user_choice_is_tempting + '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            if (dr.how_to_get_correct) s += '<br><br>' + (dr.how_to_get_correct + '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            fb.innerHTML = s;
+          }
+        }
+        if (data.all_done) {
+          document.getElementById('btnPerQuestionSubmit').style.display = 'none';
+          document.getElementById('btnPerQuestionNext').style.display = 'none';
+          const reportDiv = document.getElementById('perQuestionReport');
+          reportDiv.innerHTML = '<h3>All done.</h3><p>Go to Step 5 and click <strong>Run diagnosis</strong> to view the full report.</p>';
+          reportDiv.style.display = 'block';
+          enableStep(5);
+        } else {
+          document.getElementById('btnPerQuestionNext').style.display = 'inline-block';
+        }
+      } catch (err) {
+        fb.className = 'msg err';
+        fb.textContent = 'Error: ' + err.message;
+      }
+      document.getElementById('btnPerQuestionSubmit').disabled = false;
+    });
+
+    document.getElementById('btnPerQuestionNext').addEventListener('click', () => {
+      perQuestionIndex++;
+      if (perQuestionIndex < perQuestionList.length) renderPerQuestion();
+    });
+
+    // Step 4: set mode, then call user-answers (for file/simulate/per_question), then show answering UI or Step 5
+    document.getElementById('form4').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const mode = document.querySelector('input[name="diagnose_mode"]:checked').value;
+      document.getElementById('btn4').disabled = true;
+      showMsg('msg4', 'Setting options and starting…', 'info');
+      try {
+        const resOpt = await fetch('/api/sessions/' + sessionId + '/diagnose-options', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode, feedback_timing: pendingFeedbackTiming })
+        });
+        if (!resOpt.ok) throw new Error((await resOpt.json().catch(() => ({}))).detail || resOpt.statusText);
+        if (pendingMethod === 'file' && pendingFile) {
+          const fd = new FormData();
+          fd.append('method', 'file');
+          fd.append('file', pendingFile);
+          const resUA = await fetch('/api/sessions/' + sessionId + '/user-answers', { method: 'POST', body: fd });
+          if (!resUA.ok) throw new Error((await resUA.json().catch(() => ({}))).detail || resUA.statusText);
+          showMsg('msg4', 'Answers loaded. Run diagnosis in Step 5.', 'ok');
+          enableStep(5);
+        } else if (pendingMethod === 'simulated') {
+          const fd = new FormData();
+          fd.append('method', 'simulated');
+          const resUA = await fetch('/api/sessions/' + sessionId + '/user-answers', { method: 'POST', body: fd });
+          if (!resUA.ok) throw new Error((await resUA.json().catch(() => ({}))).detail || resUA.statusText);
+          showMsg('msg4', 'Simulated answers done. Run diagnosis in Step 5.', 'ok');
+          enableStep(5);
+        } else if (pendingMethod === 'interactive' && pendingFeedbackTiming === 'per_question') {
+          const fd = new FormData();
+          fd.append('method', 'interactive');
+          fd.append('feedback_timing', 'per_question');
+          const resUA = await fetch('/api/sessions/' + sessionId + '/user-answers', { method: 'POST', body: fd });
+          const dataUA = await resUA.json().catch(() => ({}));
+          if (!resUA.ok) throw new Error(dataUA.detail || resUA.statusText);
+          document.getElementById('step4PerQuestionWrap').style.display = 'block';
+          document.getElementById('perQuestionReport').style.display = 'none';
+          const qRes = await fetch('/api/sessions/' + sessionId + '/questions');
+          const qData = await qRes.json();
+          perQuestionList = qData.questions || [];
+          perQuestionIndex = 0;
+          if (perQuestionList.length) { showMsg('msg4', 'Answer each question below.', 'ok'); renderPerQuestion(); }
+          else showMsg('msg4', 'No questions.', 'err');
+        } else if (pendingMethod === 'interactive' && pendingFeedbackTiming === 'after_all') {
+          document.getElementById('step4AnswerAllWrap').style.display = 'block';
+          await loadQuestions();
+          showMsg('msg4', 'Enter all answers below, then click Submit all answers.', 'ok');
+        }
+      } catch (err) {
+        showMsg('msg4', 'Error: ' + err.message, 'err');
+      }
+      document.getElementById('btn4').disabled = false;
+    });
+
+    document.getElementById('btnSubmitAllAnswers').addEventListener('click', async () => {
+      const answers = {};
+      document.querySelectorAll('#questions-list input[data-id]').forEach(inp => {
+        const v = inp.value.trim();
+        if (v) answers[inp.getAttribute('data-id')] = v;
+      });
+      const fd = new FormData();
+      fd.append('method', 'interactive');
+      fd.append('feedback_timing', 'after_all');
+      fd.append('answers', JSON.stringify(answers));
+      showMsg('msg4', 'Submitting…', 'info');
+      try {
+        const res = await fetch('/api/sessions/' + sessionId + '/user-answers', { method: 'POST', body: fd });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+        showMsg('msg4', 'Done. Run diagnosis in Step 5.', 'ok');
+        enableStep(5);
+      } catch (err) {
+        showMsg('msg4', 'Error: ' + err.message, 'err');
+      }
+    });
+
+    // Step 5
+    document.getElementById('btnRunDiagnose').addEventListener('click', async () => {
+      showMsg('msg5', 'Running diagnosis…', 'info');
+      document.getElementById('report').style.display = 'none';
+      try {
+        const res = await fetch('/api/sessions/' + sessionId + '/run-diagnose', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        showMsg('msg5', 'Done. Correct: ' + data.correct_count + ' / ' + data.answered_questions + '. Incorrect: ' + (data.incorrect_ids || []).join(', '), 'ok');
+        const reportRes = await fetch('/api/sessions/' + sessionId + '/report');
+        if (reportRes.ok) {
+          const report = document.getElementById('report');
+          report.innerHTML = '<h3>Report</h3><pre>' + (await reportRes.text()).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
+          report.style.display = 'block';
+        }
+      } catch (err) {
+        showMsg('msg5', 'Error: ' + err.message, 'err');
+      }
+    });
+  </script>
+</body>
+</html>

@@ -112,6 +112,12 @@ python -m sat_tutor.run --pdf data/samples/Cross.pdf --subject english --correct
 ```
 (Replace file paths with your own PDF and answer JSON files)
 
+### Web
+```bash
+python -m sat_tutor.web_app
+```
+Then open http://127.0.0.1:8000 in your browser.
+
 After running, the system will:
 1. Convert PDF to images
 2. Extract questions (Vision for Math, OCR for English)

@@ -35,7 +35,7 @@ from ..io.answers import (
     collect_single_answer_interactive,
     maybe_collect_handwritten_work
 )
-from ..io.student_simulator import ask_simulate_student
+from ..io.student_simulator import ask_simulate_student, simulate_and_save_answers, get_student_config
 from ..utils.logging import Logger, create_session_logger
 from ..utils.time import generate_session_id
 
@@ -139,6 +139,17 @@ class GREMathPipeline:
         self.session_id: Optional[str] = None
         self.session_dir: Optional[str] = None
         self.logger: Optional[Logger] = None
+        # Web step-by-step state (set by run_*_step methods)
+        self._web_questions: list = []
+        self._web_failed_pages: list = []
+        self._web_errors: list = []
+        self._web_pdf_path: str = ""
+        self._web_mode: RunMode = "diagnose"
+        self._web_solve_results: list = []
+        self._web_user_answers: dict = {}
+        self._web_answer_input_meta: dict = {}
+        self._web_diagnose_mode: str = "B"
+        self._web_student_work_map: dict = {}
     
     def _init_session(self) -> None:
         """Initialize session"""
@@ -176,6 +187,199 @@ class GREMathPipeline:
         pdf_name = data.get("pdf_name", "unknown.pdf")
         
         return questions, failed_pages, errors, pdf_name
+
+    # -------------------------------------------------------------------------
+    # Web step-by-step API (same flow as CLI, one step per request)
+    # -------------------------------------------------------------------------
+
+    def run_transcribe_step(
+        self,
+        pdf_path: str,
+        mode: RunMode = "diagnose",
+        pages: str = "all",
+        dpi: int = 300,
+        transcribed_json: Optional[str] = None
+    ) -> dict:
+        """
+        Run Stage 0 + T only. Used by web UI. Call run_solve_step next.
+        """
+        self._init_session()
+        self._web_mode = mode
+        self._web_pdf_path = pdf_path or ""
+        self.logger.info(f"Run mode: {mode}")
+        self.logger.info(f"Subject: {self.subject}")
+        errors: list = []
+
+        if transcribed_json:
+            self.logger.info(f"Loading transcribed file: {transcribed_json}")
+            questions, failed_pages, extract_errors, pdf_name = self._load_transcribed(transcribed_json)
+            if not pdf_path:
+                self._web_pdf_path = pdf_name
+            self.logger.info(f"Loaded {len(questions)} questions from transcribed file")
+        else:
+            self.logger.info(f"Starting to process PDF: {pdf_path}")
+            self.logger.info(f"Page range: {pages}")
+            pdf_name = os.path.basename(pdf_path)
+            self.logger.info("Stage 0: PDF to Images")
+            try:
+                pages_dir = os.path.join(self.session_dir, "pages")
+                image_paths = pdf_to_images(
+                    pdf_path=pdf_path,
+                    output_dir=pages_dir,
+                    pages=pages,
+                    dpi=dpi
+                )
+                self.logger.info(f"Successfully converted {len(image_paths)} pages")
+            except PDFConversionError as e:
+                self.logger.error(f"PDF conversion failed: {e}")
+                raise
+            self.logger.info("Stage T: Transcribe")
+            if self.subject == "english":
+                questions, failed_pages, extract_errors = self._extract_english_questions(
+                    image_paths=image_paths, pdf_name=pdf_name
+                )
+            else:
+                extractor = VisionQuestionExtractor(self.llm, self.logger)
+                questions, failed_pages, extract_errors = extractor.extract_from_images(
+                    image_paths=image_paths, pdf_name=pdf_name
+                )
+            self.logger.info(f"Successfully extracted {len(questions)} questions")
+
+        self._web_questions = questions
+        self._web_failed_pages = failed_pages
+        self._web_errors = list(extract_errors) if extract_errors else []
+        if failed_pages:
+            self.logger.warning(f"Failed pages: {failed_pages}")
+        transcribed_path = os.path.join(self.session_dir, "transcribed.json")
+        save_transcribed(
+            questions,
+            transcribed_path,
+            pdf_name=os.path.basename(self._web_pdf_path) or None,
+            failed_pages=failed_pages,
+            errors=self._web_errors
+        )
+        return {
+            "session_id": self.session_id,
+            "session_dir": self.session_dir,
+            "question_count": len(questions),
+            "failed_pages": failed_pages,
+            "errors": self._web_errors,
+            "mode": mode,
+        }
+
+    def run_solve_step(
+        self,
+        use_correct_answers_file: bool,
+        correct_answers_path: Optional[str] = None
+    ) -> dict:
+        """
+        Run Stage S. Requires run_transcribe_step first. Used by web UI.
+        """
+        questions = self._web_questions
+        errors = list(self._web_errors)
+        if use_correct_answers_file and correct_answers_path:
+            self.logger.info("Stage S: Using correct answers file")
+            try:
+                solve_results = load_correct_answers_as_solve_results(
+                    correct_answers_path, questions
+                )
+                self.logger.info(f"Loaded {len(solve_results)} answers from correct answers file")
+                loaded_ids = {sr.question_id for sr in solve_results}
+                missing_questions = [q for q in questions if q.id not in loaded_ids]
+                if missing_questions:
+                    missing_ids = [q.id for q in missing_questions]
+                    self.logger.warning(f"Questions not in correct answers file, will use LLM: {missing_ids}")
+                    solver = QuestionSolver(self.llm, self.logger)
+                    extra_results, extra_errors = solver.solve_batch(missing_questions)
+                    solve_results = list(solve_results) + list(extra_results)
+                    errors.extend(extra_errors)
+            except Exception as e:
+                self.logger.error(f"Failed to load correct answers file: {e}")
+                raise ValueError(f"Cannot load correct answers file: {e}")
+        else:
+            self.logger.info("Stage S: LLM Solving")
+            solver = QuestionSolver(self.llm, self.logger)
+            solve_results, solve_errors = solver.solve_batch(questions)
+            self.logger.info(f"Successfully solved {len(solve_results)} questions")
+            errors.extend(solve_errors)
+        self._web_solve_results = solve_results
+        self._web_errors = errors
+        return {"solve_count": len(solve_results), "errors": errors}
+
+    def set_user_answers_step(
+        self,
+        method: Literal["file", "interactive", "simulated"],
+        file_path: Optional[str] = None,
+        answers_dict: Optional[dict] = None
+    ) -> None:
+        """
+        Set user answers for diagnose. Requires run_solve_step first. Used by web UI.
+        method: "file" (provide file_path), "interactive" (provide answers_dict), "simulated" (run AI simulator).
+        """
+        questions = self._web_questions
+        solve_results = self._web_solve_results
+        if method == "file" and file_path:
+            user_answers = load_answers_from_json(file_path)
+            self._web_user_answers = user_answers
+            self._web_answer_input_meta = {"input_mode": "file", "feedback_timing": "after_all"}
+        elif method == "interactive" and answers_dict is not None:
+            self._web_user_answers = dict(answers_dict)
+            self._web_answer_input_meta = {"input_mode": "interactive", "feedback_timing": "after_all"}
+        elif method == "simulated":
+            config = get_student_config()
+            output_path = os.path.join(self.session_dir, "simulated_student_answers.json")
+            user_answers = simulate_and_save_answers(
+                llm_client=self.llm,
+                questions=questions,
+                output_path=output_path,
+                solve_results=solve_results,
+                correct_rate=config.get("correct_rate", 70),
+                subject=self.subject
+            )
+            self._web_user_answers = user_answers
+            self._web_answer_input_meta = {"input_mode": "simulated", "feedback_timing": "after_all"}
+        else:
+            self._web_user_answers = {}
+            self._web_answer_input_meta = {"input_mode": "preset", "feedback_timing": "after_all"}
+
+    def set_diagnose_options_step(self, mode: str = "B", feedback_timing: str = "after_all") -> None:
+        """Set diagnosis mode for web. A/B/C and feedback_timing."""
+        self._web_diagnose_mode = mode.upper() if mode else "B"
+        self._web_answer_input_meta["feedback_timing"] = feedback_timing
+
+    def run_diagnose_step(self) -> SessionResult:
+        """
+        Run Stage D. Requires set_user_answers_step and set_diagnose_options_step. Used by web UI.
+        """
+        questions = self._web_questions
+        solve_results = self._web_solve_results
+        user_answers = self._web_user_answers
+        diagnose_mode = self._web_diagnose_mode
+        student_work_map = self._web_student_work_map
+        errors = list(self._web_errors)
+        diagnoser = ErrorDiagnoser(self.llm, self.logger, subject=self.subject)
+        diagnose_results, diagnose_errors = diagnoser.diagnose_batch(
+            questions=questions,
+            solve_results=solve_results,
+            user_answers=user_answers,
+            mode=diagnose_mode,
+            student_work_map=student_work_map
+        )
+        self.logger.info(f"Completed diagnosis for {len(diagnose_results)} questions")
+        errors.extend(diagnose_errors)
+        result = create_session_output(
+            session_id=self.session_id,
+            pdf_path=self._web_pdf_path,
+            mode=self._web_mode,
+            questions=questions,
+            failed_pages=self._web_failed_pages,
+            errors=errors,
+            solve_results=solve_results,
+            diagnose_results=diagnose_results,
+            user_answers=user_answers
+        )
+        self._save_and_print(result)
+        return result
     
     def run(
         self,
