@@ -25,3 +25,7 @@ outputs/session_*/
 .DS_Store
 Thumbs.db
 
+# MD files
+MODE_C_MATH_PROMPTS.md
+MODE_C_PROMPTS_FLOW.md
+

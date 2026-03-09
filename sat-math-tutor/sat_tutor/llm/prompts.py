@@ -746,6 +746,8 @@ DIAGNOSE_SCHEMA_HINT = """{
   "option_analysis": [{"option": "A", "content": "...", "analysis": "...", "is_correct": false, "is_user_choice": true}]
 }"""
 
+
+### Not used
 DIAGNOSE_SCHEMA_HINT_NUMERIC = """{
   "question_id": "string",
   "user_answer": "string",

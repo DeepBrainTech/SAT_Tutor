@@ -30,7 +30,10 @@ from ..io.answers import (
     ask_correct_answers_choice,
     ask_user_answers_choice,
     ask_diagnose_mode,
-    collect_second_attempt
+    ask_feedback_timing,
+    collect_second_attempt,
+    collect_single_answer_interactive,
+    maybe_collect_handwritten_work
 )
 from ..io.student_simulator import ask_simulate_student
 from ..utils.logging import Logger, create_session_logger
@@ -336,6 +339,11 @@ class GREMathPipeline:
         self.logger.info("Collecting user answers")
         
         student_work_map: dict[str, dict] = {}
+        diagnose_results: list[DiagnoseResult] = []
+        diagnose_errors: list[str] = []
+        diagnose_mode = "B"
+        feedback_timing = "after_all"
+        answer_input_meta = {"input_mode": "preset", "feedback_timing": "after_all"}
         
         if answers_json:
             try:
@@ -345,7 +353,7 @@ class GREMathPipeline:
                 self.logger.error(f"Failed to load user answers file: {e}")
                 user_answers = {}
         elif interactive:
-            user_answers, student_work_map = ask_user_answers_choice(
+            user_answers, student_work_map, answer_input_meta = ask_user_answers_choice(
                 questions, 
                 llm_client=self.llm,
                 solve_results=solve_results,
@@ -355,24 +363,29 @@ class GREMathPipeline:
         else:
             user_answers = {}
         
+        if interactive and mode == "diagnose":
+            diagnose_mode = ask_diagnose_mode()
+            self.logger.info(f"Selected diagnosis mode: {diagnose_mode}")
+            feedback_timing = answer_input_meta.get("feedback_timing", "after_all")
+        
         if student_work_map:
             work_path = os.path.join(self.session_dir, "student_work_transcriptions.json")
             save_json(student_work_map, work_path)
             self.logger.info(f"Saved handwritten work transcriptions: {work_path}")
-        
-        # ===== Select Diagnosis Mode =====
-        diagnose_mode = "B"  # Default: Contrastive
-        if interactive:
-            diagnose_mode = ask_diagnose_mode()
-            self.logger.info(f"Selected diagnosis mode: {diagnose_mode}")
         
         # ===== Stage D: Diagnose =====
         self.logger.info(f"Stage D: Diagnose (Mode {diagnose_mode})")
         
         diagnoser = ErrorDiagnoser(self.llm, self.logger, subject=self.subject)
         
-        # Mode C requires special handling (scaffolded tutoring)
-        if diagnose_mode == "C" and interactive:
+        if interactive and mode == "diagnose" and answer_input_meta.get("input_mode") == "interactive" and feedback_timing == "per_question":
+            user_answers, student_work_map, diagnose_results, diagnose_errors = self._diagnose_immediately_per_question(
+                diagnoser=diagnoser,
+                questions=questions,
+                solve_results=solve_results,
+                diagnose_mode=diagnose_mode
+            )
+        elif diagnose_mode == "C" and interactive:
             diagnose_results, diagnose_errors = self._diagnose_mode_c(
                 diagnoser=diagnoser,
                 questions=questions,
@@ -391,6 +404,11 @@ class GREMathPipeline:
         
         self.logger.info(f"Completed diagnosis for {len(diagnose_results)} questions")
         errors.extend(diagnose_errors)
+
+        if student_work_map:
+            work_path = os.path.join(self.session_dir, "student_work_transcriptions.json")
+            save_json(student_work_map, work_path)
+            self.logger.info(f"Saved handwritten work transcriptions: {work_path}")
         
         result = create_session_output(
             session_id=self.session_id,
@@ -407,6 +425,189 @@ class GREMathPipeline:
         self._save_and_print(result)
         return result
     
+
+    def _show_immediate_result(self, result: DiagnoseResult) -> None:
+        """Show concise immediate feedback during per-question diagnose mode."""
+        from rich.console import Console
+        from rich.panel import Panel
+
+        console = Console(width=100)
+        if result.is_correct:
+            console.print("[green]Correct.[/green]")
+            return
+
+        body = []
+        if result.why_user_choice_is_tempting:
+            body.append(f"[bold]Error Analysis:[/bold]\n{result.why_user_choice_is_tempting}")
+        if result.how_to_get_correct:
+            body.append(f"[bold]Explanation:[/bold]\n{result.how_to_get_correct}")
+        if not body:
+            body.append("No explanation available.")
+        console.print(Panel("\n\n".join(body), title="[bold]Immediate Feedback[/bold]", border_style="cyan"))
+
+    def _run_mode_c_retry_loop(
+        self,
+        diagnoser: ErrorDiagnoser,
+        question: Question,
+        solve_result: SolveResult,
+        first_answer: str,
+        hint_result: dict,
+        student_work_text: Optional[str] = None
+    ) -> tuple[str, bool]:
+        """Run Mode C retries with a hard cap of 3 total attempts."""
+        from rich.console import Console
+
+        console = Console(width=100)
+        correct_answer = solve_result.correct_answer.strip()
+        current_answer = first_answer
+        final_answer = first_answer
+        attempt_count = 1
+        max_attempts = 3
+
+        while attempt_count < max_attempts:
+            next_answer = collect_second_attempt(
+                question=question,
+                first_answer=current_answer,
+                hint_result=hint_result
+            )
+
+            final_answer = next_answer
+            attempt_count += 1
+
+            is_correct_now = diagnoser._check_answer_correct(
+                final_answer, correct_answer, question.problem_type
+            )
+            if is_correct_now:
+                return final_answer, False
+
+            if attempt_count >= max_attempts:
+                console.print("\n[red]Attempt limit reached for this question. Moving to the next question.[/red]")
+                return final_answer, True
+
+            refreshed_hint = diagnoser.get_hint_for_wrong_answer(
+                question=question,
+                solve_result=solve_result,
+                user_answer=final_answer,
+                student_work_text=student_work_text
+            )
+            if refreshed_hint:
+                hint_result["error_analysis"] = refreshed_hint.get(
+                    "error_analysis",
+                    hint_result.get("error_analysis", "")
+                )
+
+            current_answer = final_answer
+            console.print("\n[yellow]Still not correct. Review the same hints and try again.[/yellow]")
+
+        return final_answer, True
+
+    def _diagnose_immediately_per_question(
+        self,
+        diagnoser: ErrorDiagnoser,
+        questions: list[Question],
+        solve_results: list[SolveResult],
+        diagnose_mode: str
+    ) -> tuple[dict[str, str], dict[str, dict], list[DiagnoseResult], list[str]]:
+        """Interactive diagnose flow that gives feedback immediately after each answer."""
+        user_answers: dict[str, str] = {}
+        student_work_map: dict[str, dict] = {}
+        results: list[DiagnoseResult] = []
+        errors: list[str] = []
+        solve_map = {sr.question_id: sr for sr in solve_results}
+
+        for idx, question in enumerate(questions, 1):
+            answer = collect_single_answer_interactive(question, idx, len(questions))
+            if answer == "__QUIT__":
+                break
+            if answer is None:
+                continue
+
+            user_answers[question.id] = answer
+            solve_result = solve_map.get(question.id)
+            if not solve_result:
+                errors.append(f"Missing solving result for question {question.id}")
+                continue
+
+            if diagnose_mode == "A":
+                result, error = diagnoser.diagnose_mode_a(question, solve_result, answer)
+                if result:
+                    results.append(result)
+                    self._show_immediate_result(result)
+                if error:
+                    errors.append(error)
+                continue
+
+            if diagnose_mode == "C":
+                correct_answer = solve_result.correct_answer.strip()
+                is_correct = diagnoser._check_answer_correct(answer, correct_answer, question.problem_type)
+                if is_correct:
+                    result = DiagnoseResult(
+                        question_id=question.id,
+                        user_answer=answer,
+                        correct_answer=correct_answer,
+                        is_correct=True,
+                        why_user_choice_is_tempting=None,
+                        likely_misconceptions=[],
+                        how_to_get_correct=None,
+                        option_analysis=[]
+                    )
+                    results.append(result)
+                    self._show_immediate_result(result)
+                    continue
+
+                from rich.console import Console
+                console = Console(width=100)
+                console.print(f"[red]Your answer is incorrect.[/red] [dim](Your answer: {answer})[/dim]")
+
+                work_info = maybe_collect_handwritten_work(question, llm_client=self.llm, subject=self.subject)
+                if work_info:
+                    student_work_map[question.id] = work_info
+                student_work_text = (work_info or {}).get("transcribed_work") or None
+
+                hint_result = diagnoser.get_hint_for_wrong_answer(
+                    question=question,
+                    solve_result=solve_result,
+                    user_answer=answer,
+                    student_work_text=student_work_text
+                )
+
+                final_answer, _ = self._run_mode_c_retry_loop(
+                    diagnoser=diagnoser,
+                    question=question,
+                    solve_result=solve_result,
+                    first_answer=answer,
+                    hint_result=hint_result,
+                    student_work_text=student_work_text
+                )
+
+                result, error = diagnoser.diagnose_after_second_attempt(
+                    question=question,
+                    solve_result=solve_result,
+                    first_attempt=answer,
+                    second_attempt=final_answer,
+                    student_work_text=student_work_text
+                )
+                user_answers[question.id] = final_answer
+                if result:
+                    if work_info:
+                        result.student_work_image_path = work_info.get("image_path")
+                        result.student_work_transcription = work_info.get("transcribed_work")
+                    results.append(result)
+                    self._show_immediate_result(result)
+                if error:
+                    errors.append(error)
+                continue
+
+            work_info = None
+            result, error = diagnoser.diagnose(question, solve_result, answer)
+            if result:
+                results.append(result)
+                self._show_immediate_result(result)
+            if error:
+                errors.append(error)
+
+        return user_answers, student_work_map, results, errors
+
     def _diagnose_mode_c(
         self,
         diagnoser: ErrorDiagnoser,
@@ -482,8 +683,14 @@ class GREMathPipeline:
             
             # Wrong answer - start scaffolded tutoring
             console.print(f"\n[yellow]Question {question.id}: Not quite right. Let's work through this...[/yellow]")
+            if not work_info:
+                collected_work = maybe_collect_handwritten_work(question, llm_client=self.llm, subject=self.subject)
+                if collected_work:
+                    student_work_map = student_work_map or {}
+                    student_work_map[question.id] = collected_work
+                    work_info = collected_work
+                    student_work_text = collected_work.get("transcribed_work") or None
 
-            
             # Step 1: Get hints
             self.logger.info(f"[Mode C] Getting hints for {question.id}")
             hint_result = diagnoser.get_hint_for_wrong_answer(
@@ -493,42 +700,14 @@ class GREMathPipeline:
                 student_work_text=student_work_text
             )
             
-            # Step 2: Keep retrying until correct.
-            # Reuse the original actionable hints, but refresh error analysis
-            # for each new wrong answer.
-            current_answer = first_answer
-            final_answer = first_answer
-            while True:
-                next_answer = collect_second_attempt(
-                    question=question,
-                    first_answer=current_answer,
-                    hint_result=hint_result
-                )
-                
-                final_answer = next_answer
-                is_correct_now = diagnoser._check_answer_correct(
-                    final_answer, correct_answer, question.problem_type
-                )
-                
-                if is_correct_now:
-                    break
-                
-                # Refresh only error analysis based on the latest wrong answer.
-                # Keep actionable hints unchanged (as requested).
-                refreshed_hint = diagnoser.get_hint_for_wrong_answer(
-                    question=question,
-                    solve_result=solve_result,
-                    user_answer=final_answer,
-                    student_work_text=student_work_text
-                )
-                if refreshed_hint:
-                    hint_result["error_analysis"] = refreshed_hint.get(
-                        "error_analysis",
-                        hint_result.get("error_analysis", "")
-                    )
-                
-                current_answer = final_answer
-                console.print("\n[yellow]Still not correct. Review the same hints and try again.[/yellow]")
+            final_answer, _ = self._run_mode_c_retry_loop(
+                diagnoser=diagnoser,
+                question=question,
+                solve_result=solve_result,
+                first_answer=first_answer,
+                hint_result=hint_result,
+                student_work_text=student_work_text
+            )
             
             # Step 3: Final diagnosis (called once, after student gets correct)
             self.logger.info(f"[Mode C] Final diagnosis for {question.id}")
@@ -548,7 +727,7 @@ class GREMathPipeline:
                 
                 # Show final result
                 if result.is_correct:
-                    console.print(f"\n[green]Excellent! You got it right on the second try![/green]")
+                    console.print(f"\n[green]Excellent! You got it right within the allowed attempts.[/green]")
                 else:
                     console.print(f"\n[red]The correct answer is: {correct_answer}[/red]")
                 

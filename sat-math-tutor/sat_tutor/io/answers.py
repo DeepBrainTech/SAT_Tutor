@@ -7,7 +7,7 @@ Supports multiple choice (A-E) and numeric entry (number/fraction/expression)
 import json
 import os
 import textwrap
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 
 from ..core.models import Question
 from ..core.validators import extract_json_from_text
@@ -208,7 +208,7 @@ def ask_user_answers_choice(
     solve_results=None,
     session_dir: str = None,
     subject: str = "math"
-) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, str], dict[str, dict[str, Any]], dict[str, str]]:
     """
     Ask user to choose answer input method
     
@@ -220,7 +220,7 @@ def ask_user_answers_choice(
         subject: "math" or "english" - determines which prompts to use for simulation
     
     Returns:
-        (user answers dict, student handwritten work dict)
+        (user answers dict, student handwritten work dict, metadata dict)
     """
     from rich.console import Console
     from rich.prompt import Prompt
@@ -252,13 +252,17 @@ You can choose:
     )
     
     if choice == "1":
-        return collect_answers_interactive(
+        feedback_timing = ask_feedback_timing()
+        if feedback_timing == "per_question":
+            return {}, {}, {"input_mode": "interactive", "feedback_timing": "per_question"}
+        answers, handwritten = collect_answers_interactive(
             questions,
             llm_client=llm_client,
             subject=subject
         )
+        return answers, handwritten, {"input_mode": "interactive", "feedback_timing": "after_all"}
     elif choice == "2":
-        return collect_answers_from_file(questions), {}
+        return collect_answers_from_file(questions), {}, {"input_mode": "file", "feedback_timing": "after_all"}
     elif choice == "3" and has_simulator:
         from .student_simulator import ask_simulate_student
         simulated_answers = ask_simulate_student(
@@ -269,20 +273,22 @@ You can choose:
             subject=subject
         )
         if simulated_answers:
-            return simulated_answers, {}
+            return simulated_answers, {}, {"input_mode": "simulated", "feedback_timing": "after_all"}
         else:
             console.print("[yellow]Falling back to interactive input...[/yellow]")
-            return collect_answers_interactive(
+            answers, handwritten = collect_answers_interactive(
                 questions,
                 llm_client=llm_client,
                 subject=subject
             )
+            return answers, handwritten, {"input_mode": "interactive", "feedback_timing": "after_all"}
     else:
-        return collect_answers_interactive(
+        answers, handwritten = collect_answers_interactive(
             questions,
             llm_client=llm_client,
             subject=subject
         )
+        return answers, handwritten, {"input_mode": "interactive", "feedback_timing": "after_all"}
 
 
 def collect_answers_from_file(questions: list[Question]) -> dict[str, str]:
@@ -388,6 +394,144 @@ def _transcribe_handwritten_work_image(
     except Exception as e:
         result["error"] = f"Handwritten work transcription parse failed: {e}"
         return result
+
+
+FeedbackTiming = Literal["per_question", "after_all"]
+
+
+def ask_feedback_timing() -> FeedbackTiming:
+    """Ask when diagnosis should be shown during interactive diagnose mode."""
+    from rich.console import Console
+    from rich.prompt import Prompt
+
+    console = Console()
+    console.print("\n" + "="*70, style="cyan")
+    console.print("Feedback Timing", style="bold cyan")
+    console.print("="*70, style="cyan")
+    console.print("""
+You can choose:
+  [1] Immediate feedback -> Diagnose each question right after you answer it
+  [2] After all answers  -> Finish all questions first, then diagnose
+""")
+
+    choice = Prompt.ask(
+        "[cyan]Please choose[/cyan]",
+        choices=["1", "2"],
+        default="2"
+    )
+    return "per_question" if choice == "1" else "after_all"
+
+
+def maybe_collect_handwritten_work(
+    question: Question,
+    llm_client=None,
+    subject: str = "math"
+) -> Optional[dict[str, Any]]:
+    """Optionally upload handwritten work after a wrong result for deeper diagnosis."""
+    from rich.console import Console
+    from rich.prompt import Prompt
+
+    console = Console(width=100)
+    if subject != "math" or llm_client is None:
+        return None
+
+    upload_choice = Prompt.ask(
+        "[cyan]Handwritten work for deeper analysis[/cyan] [dim](1=skip, 2=upload image)[/dim]",
+        choices=["1", "2"],
+        default="1"
+    )
+    if upload_choice != "2":
+        return None
+
+    image_path = Prompt.ask(
+        "[cyan]Enter handwritten work image path[/cyan]",
+        default="",
+        show_default=False
+    ).strip()
+    if not image_path:
+        return None
+
+    work_info = _transcribe_handwritten_work_image(
+        llm_client=llm_client,
+        image_path=image_path,
+        question_id=question.id
+    )
+    if work_info.get("error"):
+        console.print(f"[yellow]Handwritten work transcription failed:[/yellow] {work_info['error']}")
+    else:
+        preview = work_info.get("transcribed_work", "") or "No transcription returned"
+        if len(preview) > 180:
+            preview = preview[:177] + "..."
+        console.print("[green]Handwritten work transcribed and saved.[/green]")
+        console.print(f"[dim]{preview}[/dim]")
+    return work_info
+
+
+def collect_single_answer_interactive(
+    question: Question,
+    index: int,
+    total: int
+) -> Optional[str]:
+    """Collect one answer interactively for a single question."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import Prompt
+
+    console = Console(width=100)
+    is_numeric = question.problem_type == "numeric_entry"
+    type_label = "[Numeric Entry]" if is_numeric else "[Multiple Choice]"
+    type_color = "magenta" if is_numeric else "cyan"
+
+    console.print(f"\n{'-'*70}")
+    console.print(f"[bold {type_color}]Question {index}/{total}[/bold {type_color}] {type_label} [dim]{question.id}[/dim]")
+    console.print()
+
+    stem_wrapped = wrap_text(question.stem, width=65)
+    console.print(Panel(
+        stem_wrapped,
+        title="[bold]Stem[/bold]",
+        border_style="dim",
+        padding=(0, 1)
+    ))
+
+    if question.latex_equations:
+        console.print("[dim]Formulas:[/dim]", end=" ")
+        console.print(", ".join(question.latex_equations), style="italic")
+
+    if question.diagram_description:
+        console.print(f"[dim]Diagram:[/dim] {question.diagram_description}")
+
+    if not is_numeric:
+        console.print()
+        for opt in ['A', 'B', 'C', 'D', 'E']:
+            content = question.choices.get(opt)
+            if content and content not in ["N/A", "UNKNOWN", None]:
+                if len(content) > 60:
+                    content_wrapped = wrap_text(content, width=55)
+                    lines = content_wrapped.split('\n')
+                    console.print(f"  [yellow]{opt}[/yellow]: {lines[0]}")
+                    for line in lines[1:]:
+                        console.print(f"      {line}")
+                else:
+                    console.print(f"  [yellow]{opt}[/yellow]: {content}")
+
+    console.print()
+    while True:
+        prompt_text = "[green]Your answer (number/fraction)[/green]" if is_numeric else "[green]Your answer (A-E)[/green]"
+        answer = Prompt.ask(prompt_text, default="", show_default=False).strip()
+        if answer.upper() == 'Q':
+            return "__QUIT__"
+        if answer == '':
+            console.print("[dim]Skipped[/dim]")
+            return None
+        if is_numeric:
+            console.print(f"[green]Recorded: {answer}[/green]")
+            return answer
+        answer_upper = answer.upper()
+        if answer_upper in ['A', 'B', 'C', 'D', 'E']:
+            console.print(f"[green]Recorded: {answer_upper}[/green]")
+            return answer_upper
+        console.print("[red]Please enter one of A-E[/red]")
 
 
 def collect_answers_interactive(
@@ -500,39 +644,6 @@ def collect_answers_interactive(
                 else:
                     console.print("[red]Please enter one of A-E[/red]")
 
-        # Optional handwritten work image upload (math interactive mode only)
-        if (
-            question.id in answers
-            and subject == "math"
-            and llm_client is not None
-        ):
-            console.print()
-            upload_choice = Prompt.ask(
-                "[cyan]Handwritten work image[/cyan] [dim](1=skip, 2=upload and transcribe)[/dim]",
-                choices=["1", "2"],
-                default="1"
-            )
-            if upload_choice == "2":
-                image_path = Prompt.ask(
-                    "[cyan]Enter handwritten work image path[/cyan]",
-                    default="",
-                    show_default=False
-                ).strip()
-                if image_path:
-                    work_info = _transcribe_handwritten_work_image(
-                        llm_client=llm_client,
-                        image_path=image_path,
-                        question_id=question.id
-                    )
-                    handwritten_work[question.id] = work_info
-                    if work_info.get("error"):
-                        console.print(f"[yellow]Handwritten work transcription failed:[/yellow] {work_info['error']}")
-                    else:
-                        preview = work_info.get("transcribed_work", "") or "No transcription returned"
-                        if len(preview) > 180:
-                            preview = preview[:177] + "..."
-                        console.print("[green]Handwritten work transcribed and saved.[/green]")
-                        console.print(f"[dim]{preview}[/dim]")
     
     console.print("\n" + "="*70, style="blue")
     console.print(f"Answering complete!", style="bold green")
