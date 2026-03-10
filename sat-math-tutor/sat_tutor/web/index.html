@@ -30,8 +30,10 @@
     .q-item .q-id { font-weight: 600; color: #1e40af; }
     .q-item .q-stem { color: #555; font-size: 0.9rem; margin: 6px 0; white-space: pre-wrap; }
     .q-item input { max-width: 120px; }
+    .q-item input[type=file] { max-width: 320px; }
     .report pre { white-space: pre-wrap; font-size: 0.85rem; background: #f8fafc; padding: 12px; border-radius: 6px; max-height: 400px; overflow: auto; }
     .dim { color: #64748b; font-size: 0.9rem; }
+    .small { color: #64748b; font-size: 0.85rem; margin-top: 4px; }
     #perQuestionCard { margin: 12px 0; padding: 12px; background: #f8fafc; border-radius: 6px; }
     #perQuestionFeedback.ok { background: #dcfce7; color: #166534; }
     #perQuestionFeedback.err { background: #fee2e2; color: #991b1b; }
@@ -135,6 +137,8 @@
       <p id="perQuestionProgress" class="dim"></p>
       <div id="perQuestionCard" class="q-item"></div>
       <label>Your answer <input type="text" id="perQuestionAnswer" placeholder="A–E or number"></label>
+      <label id="perQuestionWorkLabel" style="display:none;">Optional handwritten work image <input type="file" id="perQuestionWorkFile" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"></label>
+      <div id="perQuestionWorkStatus" class="small" style="display:none;"></div>
       <button type="button" id="btnPerQuestionSubmit">Submit answer</button>
       <div id="perQuestionFeedback" class="msg" style="display:none; margin-top:12px;"></div>
       <button type="button" id="btnPerQuestionNext" style="display:none;">Next question</button>
@@ -147,11 +151,21 @@
     <h2>Step 5: Run diagnosis</h2>
     <button type="button" id="btnRunDiagnose">Run diagnosis (Stage D)</button>
     <div id="msg5" class="msg" style="display:none;"></div>
+    <div id="modeCWrap" style="display:none; margin-top:16px;">
+      <p id="modeCProgress" class="dim"></p>
+      <div id="modeCQuestionCard" class="q-item"></div>
+      <div id="modeCHints" class="msg info" style="display:none;"></div>
+      <label>Your second answer <input type="text" id="modeCSecondAnswer" placeholder="A–E or number"></label>
+      <button type="button" id="btnModeCSecondAnswer">Submit second answer</button>
+    </div>
     <div id="report" class="report" style="display:none; margin-top:16px;"></div>
   </div>
 
   <script>
     let sessionId = null;
+    let questionMap = {};
+    let perQuestionModeCPending = null;
+    let batchModeCPending = null;
 
     function showMsg(elId, text, type) {
       const el = document.getElementById(elId);
@@ -161,6 +175,76 @@
     }
     function enableStep(stepNum) {
       document.getElementById('step' + stepNum).classList.remove('disabled');
+    }
+    function escapeHtml(s) {
+      return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    function rememberQuestions(questions) {
+      (questions || []).forEach(q => { questionMap[q.id] = q; });
+    }
+    function renderQuestionCard(q) {
+      const isNum = q.problem_type === 'numeric_entry';
+      let html = '<span class="q-id">' + escapeHtml(q.id) + '</span> ' + (isNum ? '[Numeric]' : '[Multiple choice]') +
+        '<div class="q-stem">' + escapeHtml(q.stem || '') + '</div>';
+      if (!isNum && q.choices) {
+        for (const opt of ['A','B','C','D','E']) {
+          const c = q.choices[opt];
+          if (c) html += '<div>' + opt + ': ' + escapeHtml(String(c)) + '</div>';
+        }
+      }
+      return html;
+    }
+    function renderModeCHints(hintResult, firstAttempt) {
+      let html = '';
+      if (firstAttempt) html += '<strong>Your previous answer:</strong> ' + escapeHtml(firstAttempt) + '<br><br>';
+      if (hintResult.error_analysis) html += '<strong>Error Analysis:</strong><br>' + escapeHtml(hintResult.error_analysis) + '<br><br>';
+      if (hintResult.key_concept_reminder) html += '<strong>Key Concept:</strong><br>' + escapeHtml(hintResult.key_concept_reminder) + '<br><br>';
+      const hints = hintResult.actionable_hints || [];
+      if (hints.length) {
+        html += '<strong>Next Steps to Try:</strong><br><br>';
+        hints.forEach((h, idx) => {
+          html += '<strong>Step ' + (h.step_number || (idx + 1)) + ':</strong> ' + escapeHtml(h.action || '') + '<br>';
+          if (h.evidence_location) html += 'Where to look: ' + escapeHtml(h.evidence_location) + '<br>';
+          if (h.guiding_question) html += 'Think: ' + escapeHtml(h.guiding_question) + '<br>';
+          if (h.expected_conclusion) html += 'What you should understand: ' + escapeHtml(h.expected_conclusion) + '<br>';
+          html += '<br>';
+        });
+      }
+      if (hintResult.try_again_prompt) html += escapeHtml(hintResult.try_again_prompt);
+      return html;
+    }
+    function formatModeCFinalLine(dr) {
+      if (!dr) return '[Mode C] Final diagnosis complete.';
+      const first = dr.first_attempt || '';
+      const finalAns = dr.user_answer || '';
+      const correct = dr.correct_answer || '';
+      return '[Mode C] Final diagnosis for question ' + (dr.question_id || '') + '. First: ' + first + ', Final: ' + finalAns + ', Correct: ' + correct;
+    }
+    function getModeCAttemptLabel(payload) {
+      const used = payload && payload.attempts_used ? payload.attempts_used : 1;
+      const remaining = payload && typeof payload.attempts_remaining === 'number' ? payload.attempts_remaining : Math.max(0, 3 - used);
+      return 'Attempt ' + used + ' of 3. Remaining retries: ' + remaining + '.';
+    }
+    async function fetchAndRenderReport() {
+      const reportRes = await fetch('/api/sessions/' + sessionId + '/report');
+      if (reportRes.ok) {
+        const report = document.getElementById('report');
+        report.innerHTML = '<h3>Report</h3><pre>' + escapeHtml(await reportRes.text()) + '</pre>';
+        report.style.display = 'block';
+      }
+    }
+    function showBatchModeC(payload) {
+      batchModeCPending = payload;
+      const q = payload.question || questionMap[payload.question_id];
+      if (q) questionMap[q.id] = q;
+      document.getElementById('modeCWrap').style.display = 'block';
+      document.getElementById('report').style.display = 'none';
+      document.getElementById('modeCProgress').textContent = 'Mode C follow-up: ' + ((payload.answered || 0) + 1) + ' of ' + (payload.total || 0) + (q ? ' (' + q.id + ')' : '') + ' | ' + getModeCAttemptLabel(payload);
+      document.getElementById('modeCQuestionCard').innerHTML = q ? renderQuestionCard(q) : '';
+      const hints = document.getElementById('modeCHints');
+      hints.style.display = 'block';
+      hints.innerHTML = renderModeCHints(payload.hint_result || {}, payload.first_attempt || '');
+      document.getElementById('modeCSecondAnswer').value = '';
     }
 
     // Load PDF list on page load
@@ -248,10 +332,30 @@
         document.getElementById('step3Hint').style.display = r.value === 'interactive' ? 'block' : 'none';
       });
     });
+    async function uploadStudentWork(questionId, file, statusEl) {
+      if (!file) return null;
+      const fd = new FormData();
+      fd.append('question_id', questionId);
+      fd.append('file', file);
+      if (statusEl) {
+        statusEl.style.display = 'block';
+        statusEl.textContent = 'Uploading handwritten work…';
+      }
+      const res = await fetch('/api/sessions/' + sessionId + '/student-work', { method: 'POST', body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      if (statusEl) {
+        const preview = (data.transcribed_work || '').trim();
+        statusEl.textContent = preview ? ('Handwritten work uploaded. Preview: ' + preview.slice(0, 120) + (preview.length > 120 ? '…' : '')) : 'Handwritten work uploaded.';
+      }
+      return data;
+    }
+
     async function loadQuestions() {
       try {
         const res = await fetch('/api/sessions/' + sessionId + '/questions');
         const data = await res.json();
+        rememberQuestions(data.questions || []);
         const list = document.getElementById('questions-list');
         list.innerHTML = '';
         (data.questions || []).forEach(q => {
@@ -260,7 +364,8 @@
           div.className = 'q-item';
           div.innerHTML = '<span class="q-id">' + q.id + '</span> ' + (isNum ? '[Numeric]' : '[Multiple choice]') +
             '<div class="q-stem">' + (q.stem || '').slice(0, 200) + (q.stem && q.stem.length > 200 ? '…' : '') + '</div>' +
-            '<label>Answer <input type="text" name="ans_' + q.id + '" placeholder="' + (isNum ? 'number or fraction' : 'A-E') + '" data-id="' + q.id + '"></label>';
+            '<label>Answer <input type="text" name="ans_' + q.id + '" placeholder="' + (isNum ? 'number or fraction' : 'A-E') + '" data-id="' + q.id + '"></label>' +
+            (q.supports_handwritten_work ? '<label>Optional handwritten work image <input type="file" data-work-id="' + q.id + '" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"></label><div class="small" id="work_status_' + q.id + '">' + (q.has_handwritten_work ? 'Handwritten work already uploaded for this question.' : '') + '</div>' : '');
           list.appendChild(div);
         });
       } catch (e) {
@@ -286,6 +391,14 @@
       document.getElementById('perQuestionCard').innerHTML = html;
       document.getElementById('perQuestionAnswer').value = '';
       document.getElementById('perQuestionAnswer').placeholder = isNum ? 'number or fraction' : 'A–E';
+      document.getElementById('btnPerQuestionSubmit').textContent = 'Submit answer';
+      const workLabel = document.getElementById('perQuestionWorkLabel');
+      const workFile = document.getElementById('perQuestionWorkFile');
+      const workStatus = document.getElementById('perQuestionWorkStatus');
+      workFile.value = '';
+      workStatus.style.display = q.has_handwritten_work ? 'block' : 'none';
+      workStatus.textContent = q.has_handwritten_work ? 'Handwritten work already uploaded for this question.' : '';
+      workLabel.style.display = q.supports_handwritten_work ? 'block' : 'none';
       document.getElementById('perQuestionFeedback').style.display = 'none';
       document.getElementById('btnPerQuestionNext').style.display = 'none';
       document.getElementById('btnPerQuestionSubmit').style.display = 'inline-block';
@@ -312,6 +425,8 @@
       if (!q) return;
       const answer = document.getElementById('perQuestionAnswer').value.trim();
       if (!answer) { showMsg('msg4', 'Enter your answer.', 'err'); return; }
+      const workFileInput = document.getElementById('perQuestionWorkFile');
+      const workStatus = document.getElementById('perQuestionWorkStatus');
       const fd = new FormData();
       fd.append('question_id', q.id);
       fd.append('answer', answer);
@@ -319,11 +434,35 @@
       const fb = document.getElementById('perQuestionFeedback');
       fb.style.display = 'block';
       fb.className = 'msg info';
-      fb.innerHTML = 'Checking…';
+      fb.innerHTML = perQuestionModeCPending ? 'Checking second attempt…' : 'Checking…';
       try {
-        const res = await fetch('/api/sessions/' + sessionId + '/answer-and-diagnose-one', { method: 'POST', body: fd });
+        if (!perQuestionModeCPending && q.supports_handwritten_work && workFileInput.files.length) {
+          await uploadStudentWork(q.id, workFileInput.files[0], workStatus);
+          q.has_handwritten_work = true;
+        }
+        let res;
+        if (perQuestionModeCPending) {
+          const secondFd = new FormData();
+          secondFd.append('question_id', q.id);
+          secondFd.append('second_attempt', answer);
+          res = await fetch('/api/sessions/' + sessionId + '/mode-c-second-attempt', { method: 'POST', body: secondFd });
+        } else {
+          res = await fetch('/api/sessions/' + sessionId + '/answer-and-diagnose-one', { method: 'POST', body: fd });
+        }
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || res.statusText);
+        if (data.mode_c_pending) {
+          perQuestionModeCPending = data;
+          fb.className = 'msg info';
+          fb.innerHTML = '<div class="small" style="margin-bottom:8px;">' + escapeHtml(getModeCAttemptLabel(data)) + '</div>' + renderModeCHints(data.hint_result || {}, data.first_attempt || '');
+          document.getElementById('perQuestionAnswer').value = '';
+          document.getElementById('perQuestionAnswer').placeholder = q.problem_type === 'numeric_entry' ? 'second answer' : 'A–E';
+          document.getElementById('btnPerQuestionSubmit').textContent = data.attempts_used >= 2 ? 'Submit final attempt' : 'Submit second answer';
+          document.getElementById('btnPerQuestionSubmit').disabled = false;
+          return;
+        }
+        perQuestionModeCPending = null;
+        document.getElementById('btnPerQuestionSubmit').textContent = 'Submit answer';
         const dr = data.diagnose_result;
         if (dr) {
           if (dr.is_correct) {
@@ -344,6 +483,19 @@
           reportDiv.innerHTML = '<h3>All done.</h3><p>Go to Step 5 and click <strong>Run diagnosis</strong> to view the full report.</p>';
           reportDiv.style.display = 'block';
           enableStep(5);
+        } else if (dr && !data.mode_c_pending) {
+          fb.className = dr.is_correct ? 'msg ok' : 'msg err';
+          fb.innerHTML = '<strong>' + escapeHtml(formatModeCFinalLine(dr)) + '</strong>';
+          document.getElementById('btnPerQuestionNext').style.display = 'none';
+          document.getElementById('btnPerQuestionSubmit').disabled = true;
+          perQuestionModeCPending = null;
+          document.getElementById('btnPerQuestionSubmit').textContent = 'Submit answer';
+          setTimeout(() => {
+            perQuestionIndex++;
+            if (perQuestionIndex < perQuestionList.length) {
+              renderPerQuestion();
+            }
+          }, 2000);
         } else {
           document.getElementById('btnPerQuestionNext').style.display = 'inline-block';
         }
@@ -355,6 +507,8 @@
     });
 
     document.getElementById('btnPerQuestionNext').addEventListener('click', () => {
+      perQuestionModeCPending = null;
+      document.getElementById('btnPerQuestionSubmit').textContent = 'Submit answer';
       perQuestionIndex++;
       if (perQuestionIndex < perQuestionList.length) renderPerQuestion();
     });
@@ -398,6 +552,7 @@
           document.getElementById('perQuestionReport').style.display = 'none';
           const qRes = await fetch('/api/sessions/' + sessionId + '/questions');
           const qData = await qRes.json();
+          rememberQuestions(qData.questions || []);
           perQuestionList = qData.questions || [];
           perQuestionIndex = 0;
           if (perQuestionList.length) { showMsg('msg4', 'Answer each question below.', 'ok'); renderPerQuestion(); }
@@ -425,6 +580,13 @@
       fd.append('answers', JSON.stringify(answers));
       showMsg('msg4', 'Submitting…', 'info');
       try {
+        const workInputs = Array.from(document.querySelectorAll('#questions-list input[data-work-id]'));
+        for (const input of workInputs) {
+          if (!input.files.length) continue;
+          const qid = input.getAttribute('data-work-id');
+          const statusEl = document.getElementById('work_status_' + qid);
+          await uploadStudentWork(qid, input.files[0], statusEl);
+        }
         const res = await fetch('/api/sessions/' + sessionId + '/user-answers', { method: 'POST', body: fd });
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
         showMsg('msg4', 'Done. Run diagnosis in Step 5.', 'ok');
@@ -438,17 +600,45 @@
     document.getElementById('btnRunDiagnose').addEventListener('click', async () => {
       showMsg('msg5', 'Running diagnosis…', 'info');
       document.getElementById('report').style.display = 'none';
+      document.getElementById('modeCWrap').style.display = 'none';
       try {
         const res = await fetch('/api/sessions/' + sessionId + '/run-diagnose', { method: 'POST' });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || res.statusText);
-        showMsg('msg5', 'Done. Correct: ' + data.correct_count + ' / ' + data.answered_questions + '. Incorrect: ' + (data.incorrect_ids || []).join(', '), 'ok');
-        const reportRes = await fetch('/api/sessions/' + sessionId + '/report');
-        if (reportRes.ok) {
-          const report = document.getElementById('report');
-          report.innerHTML = '<h3>Report</h3><pre>' + (await reportRes.text()).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
-          report.style.display = 'block';
+        if (data.mode_c_pending) {
+          showMsg('msg5', 'Mode C hints ready. Submit the second answer below.', 'ok');
+          showBatchModeC(data);
+          return;
         }
+        showMsg('msg5', 'Done. Correct: ' + data.correct_count + ' / ' + data.answered_questions + '. Incorrect: ' + (data.incorrect_ids || []).join(', '), 'ok');
+        await fetchAndRenderReport();
+      } catch (err) {
+        showMsg('msg5', 'Error: ' + err.message, 'err');
+      }
+    });
+
+    document.getElementById('btnModeCSecondAnswer').addEventListener('click', async () => {
+      if (!batchModeCPending || !batchModeCPending.question) return;
+      const answer = document.getElementById('modeCSecondAnswer').value.trim();
+      if (!answer) { showMsg('msg5', 'Enter the second answer first.', 'err'); return; }
+      const fd = new FormData();
+      fd.append('question_id', batchModeCPending.question.id);
+      fd.append('second_attempt', answer);
+      showMsg('msg5', 'Checking second attempt…', 'info');
+      try {
+        const res = await fetch('/api/sessions/' + sessionId + '/mode-c-second-attempt', { method: 'POST', body: fd });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        if (data.next_mode_c) {
+          showMsg('msg5', 'Saved. Next Mode C question ready below.', 'ok');
+          showBatchModeC(data.next_mode_c);
+          return;
+        }
+        batchModeCPending = null;
+        document.getElementById('modeCWrap').style.display = 'none';
+        const dr = data.diagnose_result || {};
+        showMsg('msg5', 'Done. Final answer: ' + (dr.user_answer || '') + '. Correct: ' + (dr.correct_answer || ''), 'ok');
+        if (data.all_done) await fetchAndRenderReport();
       } catch (err) {
         showMsg('msg5', 'Error: ' + err.message, 'err');
       }

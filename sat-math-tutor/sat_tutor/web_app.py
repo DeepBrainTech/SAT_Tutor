@@ -24,8 +24,10 @@ from pydantic import BaseModel
 
 from .core.pipeline import GREMathPipeline
 from .core.diagnose import ErrorDiagnoser
+from .core.models import DiagnoseResult
 from .io.json_io import create_session_output, save_session_result
 from .io.report_md import save_report_md
+from .io.answers import _transcribe_handwritten_work_image
 
 app = FastAPI(title="SAT Tutor Web", description="Step-by-step same as CLI")
 
@@ -95,6 +97,146 @@ def _resolve_pdf_path(relative_path: str) -> Path:
     return full
 
 
+def _serialize_question(question) -> dict:
+    return {
+        "id": question.id,
+        "stem": question.stem,
+        "choices": question.choices,
+        "problem_type": question.problem_type,
+        "latex_equations": getattr(question, "latex_equations", []) or [],
+        "diagram_description": getattr(question, "diagram_description", None),
+    }
+
+
+def _completed_count(rec: dict) -> int:
+    return len(rec.get("diagnose_results", []))
+
+
+def _solve_map(pipeline: GREMathPipeline) -> dict:
+    return {sr.question_id: sr for sr in pipeline._web_solve_results}
+
+
+def _make_mode_c_correct_result(question, solve_result, answer: str, work_info: Optional[dict] = None) -> DiagnoseResult:
+    correct_answer = solve_result.correct_answer.strip()
+    result = DiagnoseResult(
+        question_id=question.id,
+        user_answer=answer.strip(),
+        correct_answer=correct_answer,
+        is_correct=True,
+        why_user_choice_is_tempting=None,
+        likely_misconceptions=[],
+        how_to_get_correct=None,
+        option_analysis=[],
+    )
+    if work_info:
+        result.student_work_image_path = work_info.get("image_path")
+        result.student_work_transcription = work_info.get("transcribed_work")
+    return result
+
+
+def _finalize_web_session(rec: dict) -> dict:
+    pipeline = rec["pipeline"]
+    session_result = create_session_output(
+        session_id=pipeline.session_id,
+        pdf_path=pipeline._web_pdf_path,
+        mode=pipeline._web_mode,
+        questions=pipeline._web_questions,
+        failed_pages=pipeline._web_failed_pages,
+        errors=pipeline._web_errors,
+        solve_results=pipeline._web_solve_results,
+        diagnose_results=rec.get("diagnose_results", []),
+        user_answers=pipeline._web_user_answers,
+    )
+    results_path = os.path.join(pipeline.session_dir, "results.json")
+    save_session_result(session_result, results_path)
+    report_path = os.path.join(pipeline.session_dir, "report.md")
+    save_report_md(session_result, report_path)
+    rec["last_session_result"] = session_result
+    rec["step"] = "diagnose_done"
+    return {
+        "session_id": session_result.session_id,
+        "total_questions": session_result.total_questions,
+        "answered_questions": session_result.answered_questions,
+        "correct_count": session_result.correct_count,
+        "incorrect_ids": session_result.incorrect_ids or [],
+        "session_dir": pipeline.session_dir,
+        "report_path": report_path,
+    }
+
+
+def _start_mode_c_question(
+    rec: dict,
+    question_id: str,
+    *,
+    first_attempt: Optional[str] = None,
+    current_attempt: Optional[str] = None,
+    attempts_used: int = 1,
+) -> dict:
+    pipeline = rec["pipeline"]
+    question = next((q for q in pipeline._web_questions if q.id == question_id), None)
+    if not question:
+        raise HTTPException(status_code=404, detail=f"Question {question_id} not found")
+    solve_result = _solve_map(pipeline).get(question_id)
+    if not solve_result:
+        raise HTTPException(status_code=400, detail=f"No solve result for {question_id}")
+    first_attempt = (first_attempt if first_attempt is not None else pipeline._web_user_answers.get(question_id) or "").strip()
+    current_attempt = (current_attempt if current_attempt is not None else first_attempt).strip()
+    student_work_text = (pipeline._web_student_work_map.get(question_id) or {}).get("transcribed_work") or None
+    diagnoser = ErrorDiagnoser(pipeline.llm, pipeline.logger, subject=pipeline.subject)
+    hint_result = diagnoser.get_hint_for_wrong_answer(
+        question=question,
+        solve_result=solve_result,
+        user_answer=current_attempt,
+        student_work_text=student_work_text,
+    )
+    rec["mode_c_pending"] = {
+        "question_id": question_id,
+        "first_attempt": first_attempt,
+        "attempts_used": attempts_used,
+    }
+    return {
+        "mode_c_pending": True,
+        "question": _serialize_question(question),
+        "first_attempt": first_attempt,
+        "current_attempt": current_attempt,
+        "hint_result": hint_result,
+        "attempts_used": attempts_used,
+        "attempts_remaining": max(0, 3 - attempts_used),
+        "answered": _completed_count(rec),
+        "total": len(pipeline._web_questions),
+    }
+
+
+def _start_mode_c_batch(rec: dict) -> dict:
+    pipeline = rec["pipeline"]
+    solve_map = _solve_map(pipeline)
+    rec["diagnose_results"] = []
+    queue: list[str] = []
+
+    for question in pipeline._web_questions:
+        first_attempt = (pipeline._web_user_answers.get(question.id) or "").strip()
+        if not first_attempt:
+            continue
+        solve_result = solve_map.get(question.id)
+        if not solve_result:
+            continue
+        correct_answer = solve_result.correct_answer.strip()
+        diagnoser = ErrorDiagnoser(pipeline.llm, pipeline.logger, subject=pipeline.subject)
+        is_correct = diagnoser._check_answer_correct(first_attempt, correct_answer, question.problem_type)
+        work_info = pipeline._web_student_work_map.get(question.id) or {}
+        if is_correct:
+            rec["diagnose_results"].append(
+                _make_mode_c_correct_result(question, solve_result, first_attempt, work_info=work_info)
+            )
+        else:
+            queue.append(question.id)
+
+    rec["mode_c_batch"] = {"queue": queue, "index": 0}
+    if not queue:
+        return _finalize_web_session(rec)
+    return _start_mode_c_question(rec, queue[0])
+
+
 @app.get("/api/pdfs")
 async def api_list_pdfs():
     """List PDF files in project data directory (e.g. data/samples/...)."""
@@ -147,15 +289,64 @@ async def api_sessions_questions(session_id: str):
     questions = pipeline._web_questions
     out = []
     for q in questions:
-        out.append({
-            "id": q.id,
-            "stem": q.stem,
-            "choices": q.choices,
-            "problem_type": q.problem_type,
-            "latex_equations": getattr(q, "latex_equations", []) or [],
-            "diagram_description": getattr(q, "diagram_description", None),
-        })
+        item = _serialize_question(q)
+        item["supports_handwritten_work"] = pipeline.subject == "math"
+        item["has_handwritten_work"] = q.id in (pipeline._web_student_work_map or {})
+        out.append(item)
     return {"questions": out}
+
+
+@app.post("/api/sessions/{session_id}/student-work")
+async def api_sessions_student_work(
+    session_id: str,
+    question_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Upload and transcribe optional student handwritten work for a single question."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    rec = sessions[session_id]
+    if rec["step"] not in ("solve_done", "answers_done", "diagnose_done"):
+        raise HTTPException(status_code=400, detail="Student work can only be uploaded after solve step")
+
+    pipeline = rec["pipeline"]
+    question = next((q for q in pipeline._web_questions if q.id == question_id), None)
+    if not question:
+        raise HTTPException(status_code=404, detail=f"Question {question_id} not found")
+    if pipeline.subject != "math":
+        raise HTTPException(status_code=400, detail="Handwritten work upload is only supported for math questions")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected")
+
+    suffix = Path(file.filename).suffix.lower() or ".png"
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use png, jpg, jpeg, or webp")
+
+    student_work_dir = Path(pipeline.session_dir) / "student_work"
+    student_work_dir.mkdir(parents=True, exist_ok=True)
+    safe_question_id = question_id.replace("/", "_")
+    saved_path = student_work_dir / f"{safe_question_id}_{uuid.uuid4().hex}{suffix}"
+    content = await file.read()
+    with open(saved_path, "wb") as f:
+        f.write(content)
+
+    work_info = _transcribe_handwritten_work_image(
+        llm_client=pipeline.llm,
+        image_path=str(saved_path),
+        question_id=question_id,
+    )
+    pipeline._web_student_work_map[question_id] = work_info
+
+    if work_info.get("error"):
+        raise HTTPException(status_code=500, detail=work_info["error"])
+
+    return {
+        "ok": True,
+        "question_id": question_id,
+        "image_path": str(saved_path),
+        "transcribed_work": work_info.get("transcribed_work", ""),
+        "confidence": work_info.get("confidence", 0.0),
+    }
 
 
 @app.post("/api/sessions/{session_id}/correct-answers")
@@ -227,7 +418,10 @@ async def api_sessions_user_answers(
         rec["diagnose_results"] = []
         pipeline._web_user_answers = {}
         pipeline._web_answer_input_meta = {"input_mode": "interactive", "feedback_timing": "per_question"}
-        pipeline.set_diagnose_options_step(mode="B", feedback_timing="per_question")
+        pipeline.set_diagnose_options_step(
+            mode=pipeline._web_diagnose_mode,
+            feedback_timing="per_question",
+        )
         return {"ok": True, "per_question": True}
     file_path = None
     answers_dict = None
@@ -272,6 +466,8 @@ async def api_sessions_answer_and_diagnose_one(
         raise HTTPException(status_code=400, detail="This session is not in per-question mode")
     if rec["step"] not in ("solve_done", "diagnose_done"):
         raise HTTPException(status_code=400, detail="Invalid step for per-question submit")
+    if any(r.question_id == question_id for r in rec.get("diagnose_results", [])):
+        raise HTTPException(status_code=400, detail=f"Question {question_id} is already completed")
     pipeline = rec["pipeline"]
     questions = pipeline._web_questions
     solve_results = pipeline._web_solve_results
@@ -282,45 +478,147 @@ async def api_sessions_answer_and_diagnose_one(
     solve_result = solve_map.get(question_id)
     if not solve_result:
         raise HTTPException(status_code=400, detail=f"No solve result for {question_id}")
-    pipeline._web_user_answers[question_id] = answer.strip()
+    answer = answer.strip()
+    pipeline._web_user_answers[question_id] = answer
     diagnoser = ErrorDiagnoser(pipeline.llm, pipeline.logger, subject=pipeline.subject)
     diagnose_mode = pipeline._web_diagnose_mode
+    student_work_text = (pipeline._web_student_work_map.get(question_id) or {}).get("transcribed_work") or None
     if diagnose_mode == "A":
         result, error = diagnoser.diagnose_mode_a(question, solve_result, answer)
+    elif diagnose_mode == "C":
+        correct_answer = solve_result.correct_answer.strip()
+        is_correct = diagnoser._check_answer_correct(answer, correct_answer, question.problem_type)
+        if is_correct:
+            work_info = pipeline._web_student_work_map.get(question_id) or {}
+            result = _make_mode_c_correct_result(question, solve_result, answer, work_info=work_info)
+            error = None
+            rec.setdefault("diagnose_results", []).append(result)
+        else:
+            payload = _start_mode_c_question(rec, question_id)
+            answered = _completed_count(rec)
+            return {
+                **payload,
+                "all_done": False,
+                "answered": answered,
+                "total": len(questions),
+            }
     else:
-        result, error = diagnoser.diagnose(question, solve_result, answer)
+        result, error = diagnoser.diagnose(
+            question,
+            solve_result,
+            answer,
+            student_work_text=student_work_text,
+        )
+        if result:
+            rec.setdefault("diagnose_results", []).append(result)
     if error and not result:
         raise HTTPException(status_code=500, detail=error)
     if result:
-        rec.setdefault("diagnose_results", []).append(result)
-    user_answers = pipeline._web_user_answers
+        if diagnose_mode != "C" and student_work_text:
+            work_info = pipeline._web_student_work_map.get(question_id) or {}
+            result.student_work_image_path = work_info.get("image_path")
+            result.student_work_transcription = work_info.get("transcribed_work")
+    answered = _completed_count(rec)
     total = len(questions)
-    answered = len(user_answers)
     all_done = answered >= total
     if all_done:
-        rec["step"] = "diagnose_done"
-        diagnose_results = rec.get("diagnose_results", [])
-        session_result = create_session_output(
-            session_id=pipeline.session_id,
-            pdf_path=pipeline._web_pdf_path,
-            mode=pipeline._web_mode,
-            questions=questions,
-            failed_pages=pipeline._web_failed_pages,
-            errors=pipeline._web_errors,
-            solve_results=solve_results,
-            diagnose_results=diagnose_results,
-            user_answers=user_answers,
-        )
-        results_path = os.path.join(pipeline.session_dir, "results.json")
-        save_session_result(session_result, results_path)
-        report_path = os.path.join(pipeline.session_dir, "report.md")
-        save_report_md(session_result, report_path)
-        rec["last_session_result"] = session_result
+        _finalize_web_session(rec)
     return {
         "diagnose_result": result.model_dump() if result else None,
         "all_done": all_done,
         "answered": answered,
         "total": total,
+    }
+
+
+@app.post("/api/sessions/{session_id}/mode-c-second-attempt")
+async def api_sessions_mode_c_second_attempt(
+    session_id: str,
+    question_id: str = Form(...),
+    second_attempt: str = Form(...),
+):
+    """Submit the second attempt for a pending Mode C question."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    rec = sessions[session_id]
+    pending = rec.get("mode_c_pending")
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending Mode C question")
+    if pending.get("question_id") != question_id:
+        raise HTTPException(status_code=400, detail="Question does not match pending Mode C step")
+
+    pipeline = rec["pipeline"]
+    question = next((q for q in pipeline._web_questions if q.id == question_id), None)
+    solve_result = _solve_map(pipeline).get(question_id)
+    if not question or not solve_result:
+        raise HTTPException(status_code=404, detail="Question or solve result not found")
+
+    work_info = pipeline._web_student_work_map.get(question_id) or {}
+    student_work_text = work_info.get("transcribed_work") or None
+    diagnoser = ErrorDiagnoser(pipeline.llm, pipeline.logger, subject=pipeline.subject)
+    second_attempt = second_attempt.strip()
+    attempts_used = int(pending.get("attempts_used", 1)) + 1
+    correct_answer = solve_result.correct_answer.strip()
+    is_correct = diagnoser._check_answer_correct(second_attempt, correct_answer, question.problem_type)
+
+    if not is_correct and attempts_used < 3:
+        next_payload = _start_mode_c_question(
+            rec,
+            question_id,
+            first_attempt=pending.get("first_attempt", ""),
+            current_attempt=second_attempt,
+            attempts_used=attempts_used,
+        )
+        return {
+            **next_payload,
+            "all_done": False,
+            "answered": _completed_count(rec),
+            "total": len(pipeline._web_questions),
+        }
+
+    result, error = diagnoser.diagnose_after_second_attempt(
+        question=question,
+        solve_result=solve_result,
+        first_attempt=pending.get("first_attempt", ""),
+        second_attempt=second_attempt,
+        student_work_text=student_work_text,
+    )
+    pipeline._web_user_answers[question_id] = second_attempt
+    if error and not result:
+        raise HTTPException(status_code=500, detail=error)
+    if result and work_info:
+        result.student_work_image_path = work_info.get("image_path")
+        result.student_work_transcription = work_info.get("transcribed_work")
+    if result:
+        rec.setdefault("diagnose_results", []).append(result)
+    rec["mode_c_pending"] = None
+
+    answered = _completed_count(rec)
+    total = len(pipeline._web_questions)
+
+    batch_state = rec.get("mode_c_batch")
+    if batch_state:
+        batch_state["index"] += 1
+        queue = batch_state.get("queue", [])
+        if batch_state["index"] < len(queue):
+            next_payload = _start_mode_c_question(rec, queue[batch_state["index"]])
+            return {
+                "diagnose_result": result.model_dump() if result else None,
+                "all_done": False,
+                "answered": answered,
+                "total": total,
+                "next_mode_c": next_payload,
+            }
+        rec["mode_c_batch"] = None
+
+    all_done = answered >= total
+    summary = _finalize_web_session(rec) if all_done else None
+    return {
+        "diagnose_result": result.model_dump() if result else None,
+        "all_done": all_done,
+        "answered": answered,
+        "total": total,
+        "summary": summary,
     }
 
 
@@ -370,8 +668,12 @@ async def api_sessions_run_diagnose(session_id: str):
                 "session_dir": pipeline.session_dir,
                 "report_path": os.path.join(pipeline.session_dir, "report.md"),
             }
+    if rec.get("mode_c_pending"):
+        return rec["mode_c_pending"]
     if rec["step"] != "answers_done":
         raise HTTPException(status_code=400, detail="Expected step: answers_done")
+    if rec["pipeline"]._web_diagnose_mode == "C":
+        return _start_mode_c_batch(rec)
     try:
         result = rec["pipeline"].run_diagnose_step()
     except Exception as e:
@@ -428,7 +730,12 @@ async def index():
         return HTMLResponse(
             "<h1>SAT Tutor Web</h1><p>Missing web/index.html. Create sat_tutor/web/index.html.</p>"
         )
-    return HTMLResponse(html.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        html.read_text(encoding="utf-8"),
+        headers={
+            "Cache-Control": "no-store"
+        },
+    )
 
 
 if __name__ == "__main__":
